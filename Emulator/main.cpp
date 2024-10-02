@@ -58,6 +58,10 @@ struct BUS
 		{
 			ram.WriteByte(addr, d);
 		}
+		else 
+		{
+			printf("Invalid write adress.");
+		}
 	}
 };
 
@@ -93,7 +97,7 @@ struct CPU6502
 		PC = FetchWord(bus);
 	}
 
-	Word SToAddress()
+	Word SPToAddress()
 	{
 		return 0x100 | S;
 	}
@@ -161,8 +165,27 @@ struct CPU6502
 		{0xAE, &CPU6502::LDX_ABS},
 		{0xAC, &CPU6502::LDY_ABS}, 
 		{0x69, &CPU6502::ADC_IMM},
+		{0x6E, &CPU6502::ROR_ABS},
 		{0xE9, &CPU6502::SBC_IMM}
 	};
+	
+	void ROR_ABS(BUS& bus) 
+	{
+		Word addr = FetchWord(bus);
+		Byte b = ReadByte(bus, addr);
+		Byte value = b >> 1;
+		numCycles++;
+
+		// Setting bit 7 of value to current carry bit
+		value |= C << 7;
+		// Setting carry bit to value of bit 0 of original byte b
+		C = 0b00000001 & b;
+
+		SendByte(bus, addr, value; 
+		
+		Z = (value == 0);
+		N = (value & 0b10000000) > 0;
+	}
 
 	void LDA_IMM(BUS& bus)
 	{
@@ -291,7 +314,8 @@ struct CPU6502
 				// Find and call relavent function from instructions map
 				void(CPU6502:: * func)(BUS&) = INSTRUCTIONS.at(instruction);
 				(this->*func)(bus);
-			} 
+			}
+			// If instruction opcode is not found in instructions map, print	
 			catch (std::out_of_range) 
 			{
 				printf("Instruction '%02X' not recognized.\n", instruction);
@@ -302,8 +326,6 @@ struct CPU6502
 
 int main()
 {
-	// Perhaps remove ROM entirely, all address space is RAM?
-
 	CPU6502 pc{};
 	BUS bus;
 
