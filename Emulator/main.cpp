@@ -1,7 +1,11 @@
-#include<stdio.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <iostream>
 #include <map>
+#include <iomanip>
+#include <vector>
+#include <ios>
+#include <fstream>
 
 typedef unsigned char Byte;
 typedef unsigned short Word;
@@ -38,6 +42,7 @@ struct BUS
 {
 	RAM256 ram;	// 0x0000 - 0x5FFF
 	ROM256 rom; // 0x8000 - 0xFFFF
+	// 0x6000 - 7FFF is used for I/O (not implemented)
 
 	Byte ReadByte(Word addr)
 	{
@@ -157,7 +162,7 @@ struct CPU6502
 	// ZPX = ZERO PAGE, X
 	// ZPY = ZERO PAGE, Y
 	const std::map<Byte, void(CPU6502::*)(BUS&)> INSTRUCTIONS = {
-		{0x4C, &CPU6502::JMP_ABS}, {0x8C, &CPU6502::STY_ABS}, {0x2D, &CPU6502::AND_ABS}, {0x06, &CPU6502::ASL_ZPG}, // ALL IN THIS COLUMN NEED TO BE MARKED ON TODOLIST
+		{0x4C, &CPU6502::JMP_ABS}, {0x8C, &CPU6502::STY_ABS}, {0x2D, &CPU6502::AND_ABS}, {0x06, &CPU6502::ASL_ZPG}, {0xD0, &CPU6502::BNE_REL}, // ALL IN THIS COLUMN NEED TO BE MARKED ON TODOLIST
 		{0x8D, &CPU6502::STA_ABS}, {0xAA, &CPU6502::TAX_IMP}, {0x0D, &CPU6502::ORA_ABS}, {0xC6, &CPU6502::DEC_ZPG},
 		{0xA9, &CPU6502::LDA_IMM}, {0xA8, &CPU6502::TAY_IMP}, {0x4D, &CPU6502::EOR_ABS}, {0x45, &CPU6502::EOR_ZPG},
 		{0xAD, &CPU6502::LDA_ABS}, {0x8A, &CPU6502::TXA_IMP}, {0x6D, &CPU6502::ADC_ABS}, {0x66, &CPU6502::ROR_ZPG},
@@ -179,6 +184,29 @@ struct CPU6502
 	};
 
 	// INSTRUCTION_ADRESSINGMODE
+	void BNE_REL(BUS& bus)
+	{
+		Byte offset = FetchByte(bus);
+
+		if (Z == 0)
+		{
+			// if negative, subtract positive value
+			if (offset & 0b10000000)
+			{
+				offset--;
+				offset = ~offset;
+				PC -= offset;
+			}
+			// if positive, add value
+			else
+			{
+				PC += offset;
+			}
+		}
+
+		numCycles++;
+	}
+
 	void SBC_ZPG(BUS& bus)
 	{
 		Word addr = FetchByte(bus);
@@ -413,7 +441,7 @@ struct CPU6502
 		Z = (value == 0);
 		N = (value & 0b10000000) > 0;
 	}
-	
+
 	void ASL_ZPG(BUS& bus)
 	{
 		Word addr = FetchByte(bus);
@@ -651,15 +679,15 @@ struct CPU6502
 		Z = Y == 0;
 		N = (Y & 0b10000000) > 0;
 	}
-	
+
 	void DEX_IMP(BUS& bus)
 	{
 		X--;
 		numCycles++;
-		
+
 		Z = X == 0;
 		N = (X & 0b10000000) > 0;
-	} 
+	}
 
 	void INX_IMP(BUS& bus)
 	{
@@ -679,13 +707,13 @@ struct CPU6502
 		N = (Y & 0b10000000) > 0;
 	}
 
-	void TXA_IMP(BUS& bus) 
+	void TXA_IMP(BUS& bus)
 	{
 		A = X;
 		numCycles++;
 
 		Z = A == 0;
-		N = (A & 0b10000000) > 0;		
+		N = (A & 0b10000000) > 0;
 	}
 
 	void TYA_IMP(BUS& bus)
@@ -694,7 +722,7 @@ struct CPU6502
 		numCycles++;
 
 		Z = A == 0;
-		N = (A & 0b10000000) > 0;		
+		N = (A & 0b10000000) > 0;
 	}
 
 	void TAX_IMP(BUS& bus)
@@ -824,7 +852,7 @@ struct CPU6502
 		Word addr = FetchWord(bus);
 		SendByte(bus, addr, X);
 	}
-	
+
 	void STY_ABS(BUS& bus)
 	{
 		Word addr = FetchWord(bus);
@@ -954,6 +982,7 @@ struct CPU6502
 		A = sum & 0x00FF;
 	}
 
+	// Excecutes based on num clock cycles
 	void Execute(BUS& bus, uint cycles)
 	{
 		while (numCycles < cycles + 2)
@@ -961,15 +990,15 @@ struct CPU6502
 			// ALL CLOCK CYCLE COUNTS FOR ALL INSTRUCTIONS INCLUDE FETCHING THE INSTRUCTION ITSELF
 			Byte instruction = FetchByte(bus);
 
-			try 
+			try
 			{
 				// Find and call relavent function from instructions map
 				void(CPU6502:: * func)(BUS&) = INSTRUCTIONS.at(instruction);
 				(this->*func)(bus);
-			} 
-			catch (std::out_of_range) 
+			}
+			catch (std::out_of_range)
 			{
-				printf("Instruction '%02X' not recognized.\n", instruction);
+				// std::cout << "Instruction " << std::hex << std::setw(3) << instruction << " not recognized" << std::endl;
 			}
 		}
 	}
@@ -984,21 +1013,52 @@ int main()
 	bus.rom.Initialize();
 
 	// Set reset vector
-	bus.rom.data[0x7FFC] = 0x00;
-	bus.rom.data[0x7FFD] = 0x80;
-	
+	//bus.rom.data[0x7FFC] = 0x00;
+	//bus.rom.data[0x7FFD] = 0x80;
+
 	// Load a program
-	Byte prg[] = { 0x01, 0x6E, 0x00, 0x80 };
+	std::vector<Byte> prg;
+
+	std::ifstream f;
+	f.open("program.bin", std::ios::binary | std::ios::in);
+
+	f >> std::noskipws;
+	if (f.fail())
+	{
+		// err
+	}
+
+	while (!f.eof())
+	{
+		Byte b;
+
+		f >> b;
+
+		if (f.fail())
+		{
+			// err
+			break;
+		}
+
+		prg.push_back(b);
+	}
+
+	f.close();
+
+	// Format console
+	std::cout << std::internal << std::setfill('0') << std::uppercase;
 
 	// Write program to ROM
-	for (uint i = 0; i < (sizeof(prg) / sizeof(prg[0])); i++)
+	for (uint i = 0; i <= prg.size(); i++)
 	{
 		bus.rom.data[i] = prg[i];
 	}
 
 	pc.Reset(bus);
-	pc.Execute(bus, 15);
-	printf("Clock cycles taken: %d", pc.numCycles);
+	pc.Execute(bus, 100);
+	std::cout << std::hex << std::setw(4) << "Accumulator: " <<  +pc.A << std::endl;
+	std::cout << std::nouppercase;
+	std::cout << std::dec << "Clock cycles taken: " << pc.numCycles << std::endl;
 
 	return 0;
 }
