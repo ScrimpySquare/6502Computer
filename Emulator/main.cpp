@@ -78,12 +78,12 @@ struct CPU6502
 	Byte X = 0;
 	Byte Y = 0;
 
-	Byte C : 1; // Carry
-	Byte N : 1; // Negative
-	Byte V : 1; // Overflow
-	Byte Z : 1; // Zero
-	Byte D : 1; // Decimal
-	Byte I : 1; // Interrupt Disable
+	bool C; // Carry
+	bool N; // Negative
+	bool V; // Overflow
+	bool Z; // Zero
+	bool D; // Decimal
+	bool I; // Interrupt Disable
 
 	void Reset(BUS& bus)
 	{
@@ -162,9 +162,9 @@ struct CPU6502
 	// ZPX = ZERO PAGE, X
 	// ZPY = ZERO PAGE, Y
 	const std::map<Byte, void(CPU6502::*)(BUS&)> INSTRUCTIONS = {
-		{0x4C, &CPU6502::JMP_ABS}, {0x8C, &CPU6502::STY_ABS}, {0x2D, &CPU6502::AND_ABS}, {0x06, &CPU6502::ASL_ZPG}, {0xD0, &CPU6502::BNE_REL}, // ALL IN THIS COLUMN NEED TO BE MARKED ON TODOLIST
-		{0x8D, &CPU6502::STA_ABS}, {0xAA, &CPU6502::TAX_IMP}, {0x0D, &CPU6502::ORA_ABS}, {0xC6, &CPU6502::DEC_ZPG},
-		{0xA9, &CPU6502::LDA_IMM}, {0xA8, &CPU6502::TAY_IMP}, {0x4D, &CPU6502::EOR_ABS}, {0x45, &CPU6502::EOR_ZPG},
+		{0x4C, &CPU6502::JMP_ABS}, {0x8C, &CPU6502::STY_ABS}, {0x2D, &CPU6502::AND_ABS}, {0x06, &CPU6502::ASL_ZPG}, {0xD0, &CPU6502::BNE_REL},
+		{0x8D, &CPU6502::STA_ABS}, {0xAA, &CPU6502::TAX_IMP}, {0x0D, &CPU6502::ORA_ABS}, {0xC6, &CPU6502::DEC_ZPG}, {0x30, &CPU6502::BMI_REL},
+		{0xA9, &CPU6502::LDA_IMM}, {0xA8, &CPU6502::TAY_IMP}, {0x4D, &CPU6502::EOR_ABS}, {0x45, &CPU6502::EOR_ZPG}, {0x10, &CPU6502::BPL_REL},
 		{0xAD, &CPU6502::LDA_ABS}, {0x8A, &CPU6502::TXA_IMP}, {0x6D, &CPU6502::ADC_ABS}, {0x66, &CPU6502::ROR_ZPG},
 		{0xCE, &CPU6502::DEC_ABS}, {0x98, &CPU6502::TYA_IMP}, {0xED, &CPU6502::SBC_ABS}, {0x26, &CPU6502::ROL_ZPG},
 		{0xEA, &CPU6502::NOP_IMP}, {0xE8, &CPU6502::INX_IMP}, {0x0A, &CPU6502::ASL_ACC}, {0x4A, &CPU6502::LSR_ACC},
@@ -184,6 +184,52 @@ struct CPU6502
 	};
 
 	// INSTRUCTION_ADRESSINGMODE
+	void BPL_REL(BUS& bus)
+	{
+		Byte offset = FetchByte(bus);
+
+		if (N == 0)
+		{
+			// if negative, subtract positive value
+			if (offset & 0b10000000)
+			{
+				offset--;
+				offset = ~offset;
+				PC -= offset;
+			}
+			// if positive, add value
+			else
+			{
+				PC += offset;
+			}
+		}
+
+		numCycles++;
+	}
+
+	void BMI_REL(BUS& bus)
+	{
+		Byte offset = FetchByte(bus);
+
+		if (N == 1)
+		{
+			// if negative, subtract positive value
+			if (offset & 0b10000000)
+			{
+				offset--;
+				offset = ~offset;
+				PC -= offset;
+			}
+			// if positive, add value
+			else
+			{
+				PC += offset;
+			}
+		}
+
+		numCycles++;
+	}
+
 	void BNE_REL(BUS& bus)
 	{
 		Byte offset = FetchByte(bus);
@@ -962,6 +1008,7 @@ struct CPU6502
 		C = sum & 0xFF00;
 		Z = ((sum & 0x00FF) == 0);
 		N = (sum & 0x0080);
+		std::cout << std::hex << std::setw(4) <<  "NEGATIVE FLAG IS " << +N << " ACCUMULATOR IS " << +A << std::endl;
 
 		A = sum & 0x00FF;
 	}
