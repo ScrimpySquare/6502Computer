@@ -1,1064 +1,1602 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <iostream>
-#include <map>
+﻿#include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <vector>
-#include <ios>
-#include <fstream>
+#include <SDL.h>
+#include <thread>
+#include <chrono>
 
 typedef unsigned char Byte;
 typedef unsigned short Word;
 typedef unsigned int uint;
 
-struct ROM256
+int width = 100;
+int height = 64;
+SDL_Window* window;
+SDL_Renderer* renderer;
+SDL_Event e;
+
+// Not realistic, would just be going as fast as it can IRL
+// Just for emu purposes
+// (ms)
+float frameDelay = 100;
+
+// Time for each clock cycle (ms)
+float clockTime = 1.0f;
+// Use clock time or just go as fast as possible
+bool useClockTime = false;
+
+bool running = true;
+
+struct ROM
 {
-	static constexpr uint MEM_SIZE = 1024 * 32;
-	Byte data[MEM_SIZE];
+    // 32k of address space
+    static constexpr Word MEM_SIZE = 1024 * 32;
+    Byte data[MEM_SIZE];
 
-	void Initialize()
-	{
-		for (uint i = 0; i < MEM_SIZE; i++)
-		{
-			data[i] = 0;
-		}
-	}
+    void Initialize()
+    {
+        // Initialize data to all 0s
+        std::fill(std::begin(data), std::end(data), 0);
+    }
 
-	Byte ReadByte(Word addr)
-	{
-		return data[addr];
-	}
+    void Load(const std::vector<Byte>& rom)
+    {
+        for (int i = 0; i < rom.size(); i++)
+        {
+                data[i] = rom[i];
+        }
+    }
+
+    Byte ReadByte(const Word addr) const
+    {
+        return data[addr];
+    }
 };
 
-struct RAM256 : ROM256
+struct RAM : ROM
 {
-	void WriteByte(Word addr, Byte d)
-	{
-		data[addr] = d;
-	}
+    void WriteByte(const Word addr, const Byte b)
+    {
+        data[addr] = b;
+    }
 };
 
-struct BUS
+struct Bus
 {
-	RAM256 ram;	// 0x0000 - 0x5FFF
-	ROM256 rom; // 0x8000 - 0xFFFF
-	// 0x6000 - 7FFF is used for I/O (not implemented)
+    // TODO: Make modular so that custom PC memory layouts can be created with components (i.e. custom memory map)
+    RAM ram; // 0x0000 - 0x5FFF
+    RAM vram; // 0x6000 - 0x7FFF
+    ROM rom; // 0x8000 - 0xFFFF
 
-	Byte ReadByte(Word addr)
-	{
-		if (addr > 0x7FFF)
-		{
-			// "addr & 0x7FFF" turns bit 15 to 0 to properly address the memory
-			return rom.ReadByte(addr & 0x7FFF);
-		}
-		else
-		{
-			return ram.ReadByte(addr);
-		}
-	}
+    Byte ReadByte(const Word addr) const
+    {
+        if (addr < 0x6000)
+        {
+            return ram.ReadByte(addr);
+        }
+        if (addr < 0x8000)
+        {
+            // Properly address vram in its relative address space
+            return vram.ReadByte(addr - 0x6000);
+        }
 
-	void WriteByte(Word addr, Byte d)
-	{
-		if (addr < 0x6000)
-		{
-			ram.WriteByte(addr, d);
-		}
-	}
+        // Properly address rom in its relative address space
+        return rom.ReadByte(addr - 0x8000);
+    }
+
+    void WriteByte(const Word addr, const Byte d)
+    {
+        if (addr < 0x6000)
+        {
+            ram.WriteByte(addr, d);
+        }
+        if (addr < 0x8000)
+        {
+            // Properly address vram in its relative address space
+            vram.WriteByte(addr - 0x6000, d);
+        }
+    }
 };
 
 struct CPU6502
 {
-	uint numCycles = 0;
-
-	Word PC = 0xFFFC; // Program Counter
-	Byte S = 0xFF;  // Stack Pointer
-
-	// Registers
-	Byte A = 0;
-	Byte X = 0;
-	Byte Y = 0;
-
-	Byte C : 1; // Carry
-	Byte N : 1; // Negative
-	Byte V : 1; // Overflow
-	Byte Z : 1; // Zero
-	Byte D : 1; // Decimal
-	Byte I : 1; // Interrupt Disable
-
-	void Reset(BUS& bus)
-	{
-		PC = 0xFFFC;
-		S = 0xFF;
-
-		C = N = V = Z = D = I = 0;
-		A = X = Y = 0;
-
-		// Little Endian
-		// Read start vector from 0xFFFC and 0xFFFD
-		PC = FetchWord(bus);
-	}
-
-	// Converts stack pointer location to valid address; adds digit 1 at the front (eg. sp = 0x5E, function returns 0x015E)
-	Word SToAddress()
-	{
-		return 0x100 | S;
-	}
-
-	Word FetchWord(BUS& bus)
-	{
-		Word w = FetchByte(bus);
-		w |= (FetchByte(bus) << 8);
-		return w;
-	}
-
-	Byte FetchByte(BUS& bus)
-	{
-		Byte b = bus.ReadByte(PC);
-		printf("%04X READ  %02X\n", PC, b);
-
-		PC++;
-		numCycles++;
-		return b;
-	}
-
-	Byte ReadByte(BUS& bus, Word addr)
-	{
-		Byte b = bus.ReadByte(addr);
-		printf("%04X READ  %02X\n", addr, b);
-
-		numCycles++;
-		return b;
-	}
-
-
-	void SendByte(BUS& bus, Word addr, Byte b)
-	{
-		printf("%04X WRITE %02X\n", addr, b);
-		bus.WriteByte(addr, b);
-
-		numCycles++;
-	}
-
-	void SendWord(BUS& bus, Word addr, Word w)
-	{
-		Byte b1 = w & 0b00001111;
-		Byte b2 = w >> 8;
-
-		SendByte(bus, addr, b1);
-		SendByte(bus, addr, b2);
-
-		numCycles++;
-	}
-
-	// TODO: Add page boundry crossing cycle duration increases (eg. +1 clock cycle taken if crosses page boundry)
-
-	// IMM = IMMEDIATE
-	// ABS = ABSOLUTE
-	// IMP = IMPLIED
-	// ZPG = ZERO PAGE
-	// ACC = ACCUMULATOR
-	// ABX = ABSOLUTE, X
-	// ABY = ABSOLUTE, Y
-	// ZPX = ZERO PAGE, X
-	// ZPY = ZERO PAGE, Y
-	const std::map<Byte, void(CPU6502::*)(BUS&)> INSTRUCTIONS = {
-		{0x4C, &CPU6502::JMP_ABS}, {0x8C, &CPU6502::STY_ABS}, {0x2D, &CPU6502::AND_ABS}, {0x06, &CPU6502::ASL_ZPG}, {0xD0, &CPU6502::BNE_REL}, // ALL IN THIS COLUMN NEED TO BE MARKED ON TODOLIST
-		{0x8D, &CPU6502::STA_ABS}, {0xAA, &CPU6502::TAX_IMP}, {0x0D, &CPU6502::ORA_ABS}, {0xC6, &CPU6502::DEC_ZPG},
-		{0xA9, &CPU6502::LDA_IMM}, {0xA8, &CPU6502::TAY_IMP}, {0x4D, &CPU6502::EOR_ABS}, {0x45, &CPU6502::EOR_ZPG},
-		{0xAD, &CPU6502::LDA_ABS}, {0x8A, &CPU6502::TXA_IMP}, {0x6D, &CPU6502::ADC_ABS}, {0x66, &CPU6502::ROR_ZPG},
-		{0xCE, &CPU6502::DEC_ABS}, {0x98, &CPU6502::TYA_IMP}, {0xED, &CPU6502::SBC_ABS}, {0x26, &CPU6502::ROL_ZPG},
-		{0xEA, &CPU6502::NOP_IMP}, {0xE8, &CPU6502::INX_IMP}, {0x0A, &CPU6502::ASL_ACC}, {0x4A, &CPU6502::LSR_ACC},
-		{0xA2, &CPU6502::LDX_IMM}, {0xC8, &CPU6502::INY_IMP}, {0xBA, &CPU6502::TSX_IMP}, {0xCD, &CPU6502::CMP_ABS},
-		{0xA0, &CPU6502::LDY_IMM}, {0xCA, &CPU6502::DEX_IMP}, {0x9A, &CPU6502::TXS_IMP}, {0xEC, &CPU6502::CPX_ABS},
-		{0xEE, &CPU6502::INC_ABS}, {0x88, &CPU6502::DEY_IMP}, {0x2A, &CPU6502::ROL_ACC}, {0xCC, &CPU6502::CPY_ABS},
-		{0xAE, &CPU6502::LDX_ABS}, {0x09, &CPU6502::ORA_IMM}, {0x6A, &CPU6502::ROR_ACC}, {0x2C, &CPU6502::BIT_ABS},
-		{0xAC, &CPU6502::LDY_ABS}, {0x49, &CPU6502::EOR_IMM}, {0xA5, &CPU6502::LDA_ZPG}, {0x24, &CPU6502::BIT_ZPG},
-		{0x69, &CPU6502::ADC_IMM}, {0x29, &CPU6502::AND_IMM}, {0x65, &CPU6502::ADC_ZPG}, {0x25, &CPU6502::AND_ZPG},
-		{0x6E, &CPU6502::ROR_ABS}, {0x18, &CPU6502::CLC_IMP}, {0xA6, &CPU6502::LDX_ZPG}, {0x05, &CPU6502::ORA_ZPG},
-		{0xE9, &CPU6502::SBC_IMM}, {0xD8, &CPU6502::CLD_IMP}, {0xA4, &CPU6502::LDY_ZPG}, {0x4E, &CPU6502::LSR_ABS},
-		{0x38, &CPU6502::SEC_IMP}, {0x58, &CPU6502::CLI_IMP}, {0x85, &CPU6502::STA_ZPG}, {0x46, &CPU6502::LSR_ZPG},
-		{0x2E, &CPU6502::ROL_ABS}, {0xB8, &CPU6502::CLV_IMP}, {0x86, &CPU6502::STX_ZPG}, {0xC5, &CPU6502::CMP_ZPG},
-		{0xF8, &CPU6502::SED_IMP}, {0xE0, &CPU6502::CPX_IMM}, {0x84, &CPU6502::STY_ZPG}, {0xE4, &CPU6502::CPX_ZPG},
-		{0x78, &CPU6502::SEI_IMP}, {0xC0, &CPU6502::CPY_IMM}, {0x0E, &CPU6502::ASL_ABS}, {0xC4, &CPU6502::CPY_ZPG},
-		{0x8E, &CPU6502::STX_ABS}, {0xC9, &CPU6502::CMP_IMM}, {0xE6, &CPU6502::INC_ZPG}, {0xE5, &CPU6502::SBC_ZPG}
-	};
-
-	// INSTRUCTION_ADRESSINGMODE
-	void BNE_REL(BUS& bus)
-	{
-		Byte offset = FetchByte(bus);
-
-		if (Z == 0)
-		{
-			// if negative, subtract positive value
-			if (offset & 0b10000000)
-			{
-				offset--;
-				offset = ~offset;
-				PC -= offset;
-			}
-			// if positive, add value
-			else
-			{
-				PC += offset;
-			}
-		}
-
-		numCycles++;
-	}
-
-	void SBC_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte b = ReadByte(bus, addr);
-
-		Word value = (Word)b ^ 0x00FF;
-		Word sum = value + A + C;
-
-		V = ((A ^ sum) & (value ^ sum) & 0x0080);
-		C = sum & 0xFF00;
-		Z = ((sum & 0x00FF) == 0);
-		N = (sum & 0x0080);
-
-		A = sum & 0x00FF;
-	}
-
-	void CMP_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte b = ReadByte(bus, addr);
-
-		C = A >= b;
-		Z = A == b;
-		N = (0b10000000 & (A - b)) > 0;
-	}
-
-	void CPX_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte b = ReadByte(bus, addr);
-
-		C = X >= b;
-		Z = X == b;
-		N = (0b10000000 & (X - b)) > 0;
-	}
-
-	void CPY_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte b = ReadByte(bus, addr);
-
-		C = Y >= b;
-		Z = Y == b;
-		N = (0b10000000 & (Y - b)) > 0;
-	}
-
-	void LSR_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte b = ReadByte(bus, addr);
-
-		C = b & 0b00000001;
-
-		b >>= 1;
-		numCycles++;
-
-		SendByte(bus, addr, b);
-
-		Z = b == 0;
-		N = (b & 0b10000000) > 0;
-	}
-
-	void LSR_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte b = ReadByte(bus, addr);
-
-		C = b & 0b00000001;
-
-		b >>= 1;
-		numCycles++;
-
-		SendByte(bus, addr, b);
-
-		Z = b == 0;
-		N = (b & 0b10000000) > 0;
-	}
-
-	void ORA_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte b = ReadByte(bus, addr);
-		A |= b;
-
-		Z = A == 0;
-		N = (A & 0b10000000) > 0;
-	}
-
-	void AND_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte b = ReadByte(bus, addr);
-		A &= b;
-
-		Z = A == 0;
-		N = (A & 0b10000000) > 0;
-	}
-
-	void BIT_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte b = ReadByte(bus, addr);
-
-		Byte value = A & b;
-
-		Z = value == 0;
-		N = b & 0b10000000;
-		V = b & 0b01000000;
-	}
-
-	void BIT_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte b = ReadByte(bus, addr);
-
-		Byte value = A & b;
-
-		Z = value == 0;
-		N = b & 0b10000000;
-		V = b & 0b01000000;
-	}
-
-	void CMP_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte b = ReadByte(bus, addr);
-
-		C = A >= b;
-		Z = A == b;
-		N = (0b10000000 & (A - b)) > 0;
-	}
-
-	void CPX_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte b = ReadByte(bus, addr);
-
-		C = X >= b;
-		Z = X == b;
-		N = (0b10000000 & (X - b)) > 0;
-	}
-
-	void CPY_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte b = ReadByte(bus, addr);
-
-		C = Y >= b;
-		Z = Y == b;
-		N = (0b10000000 & (Y - b)) > 0;
-	}
-
-	void LSR_ACC(BUS& bus)
-	{
-		C = A & 0b00000001;
-
-		A >>= 1;
-		numCycles++;
-
-		Z = A == 0;
-		N = (A & 0b10000000) > 0;
-	}
-
-	void ROR_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte b = ReadByte(bus, addr);
-
-		Byte value = b >> 1;
-		numCycles++;
-
-		// Set bit 7 of value byte to value of the carry flag
-		value |= C << 7;
-		// Set carry bit to bit 0 of original byte
-		C = 0b00000001 & b;
-
-		SendByte(bus, addr, value);
-
-		Z = (value == 0);
-		N = (value & 0b10000000) > 0;
-	}
-
-	void ROL_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte b = ReadByte(bus, addr);
-
-		Byte value = b << 1;
-		numCycles++;
-
-		// Set bit 0 of value byte to value of the carry flag
-		value |= C;
-		// Set carry bit to bit 7 of original byte
-		C = 0b10000000 & b;
-
-		SendByte(bus, addr, value);
-
-		Z = (value == 0);
-		N = (value & 0b10000000) > 0;
-	}
-
-	void EOR_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte b = ReadByte(bus, addr);
-		A ^= b;
-
-		Z = A == 0;
-		N = (A & 0b10000000) > 0;
-	}
-
-	void DEC_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte value = ReadByte(bus, addr);
-		value--;
-		SendByte(bus, addr, value);
-		numCycles++;
-
-		Z = (value == 0);
-		N = (value & 0b10000000) > 0;
-	}
-
-	void INC_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte value = ReadByte(bus, addr);
-		value++;
-		SendByte(bus, addr, value);
-		numCycles++;
-
-		Z = (value == 0);
-		N = (value & 0b10000000) > 0;
-	}
-
-	void ASL_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte b = ReadByte(bus, addr);
-		C = b & 0b10000000;
-
-		b <<= 1;
-		numCycles++;
-
-		SendByte(bus, addr, b);
-
-		Z = b == 0;
-		N = (b & 0b10000000) > 0;
-	}
-
-	void ASL_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte b = ReadByte(bus, addr);
-		C = b & 0b10000000;
-
-		b <<= 1;
-		numCycles++;
-
-		SendByte(bus, addr, b);
-
-		Z = b == 0;
-		N = (b & 0b10000000) > 0;
-	}
-
-	void STA_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		SendByte(bus, addr, A);
-	}
-
-	void STX_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		SendByte(bus, addr, X);
-	}
-
-	void STY_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		SendByte(bus, addr, Y);
-	}
-
-	void LDY_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Y = ReadByte(bus, addr);
-
-		Z = (Y == 0);
-		N = (Y & 0x0080);
-	}
-
-	void LDX_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		X = ReadByte(bus, addr);
-
-		Z = (X == 0);
-		N = (X & 0x0080);
-	}
-
-	void ADC_ZPG(BUS& bus)
-	{
-		Word addr = FetchByte(bus);
-		Byte value = ReadByte(bus, addr);
-		Word sum = value + A + C;
-
-		V = ((A ^ sum) & (value ^ sum) & 0x0080);
-		C = sum & 0xFF00;
-		Z = ((sum & 0x00FF) == 0);
-		N = (sum & 0x0080);
-
-		A = sum & 0x00FF;
-	}
-
-	void LDA_ZPG(BUS& bus)
-	{
-		// Automatically casts byte to word, leaving most significant byte zeroed
-		Word addr = FetchByte(bus);
-		A = ReadByte(bus, addr);
-
-		Z = (A == 0);
-		N = (A & 0b10000000) > 0;
-	}
-
-	void ROR_ACC(BUS& bus)
-	{
-		Byte value = A >> 1;
-		numCycles++;
-
-		// Set bit 7 of value byte to value of the carry flag
-		value |= C << 7;
-		// Set carry bit to bit 0 of accumulator
-		C = 0b00000001 & A;
-
-		Z = (value == 0);
-		N = (value & 0b10000000) > 0;
-	}
-
-	void ROL_ACC(BUS& bus)
-	{
-		Byte value = A << 1;
-		numCycles++;
-
-		// Set bit 0 of value byte to value of the carry flag
-		value |= C;
-		// Set carry bit to bit 7 of accumulator
-		C = 0b10000000 & A;
-
-		Z = (value == 0);
-		N = (value & 0b10000000) > 0;
-	}
-
-	void TXS_IMP(BUS& bus)
-	{
-		S = X;
-	}
-
-	void TSX_IMP(BUS& bus)
-	{
-		X = S;
-
-		Z = X == 0;
-		N = (X & 0b10000000) > 0;
-	}
-
-	void ASL_ACC(BUS& bus)
-	{
-		C = A & 0b10000000;
-
-		A <<= 1;
-		numCycles++;
-
-		Z = A == 0;
-		N = (A & 0b10000000) > 0;
-	}
-
-	void CMP_IMM(BUS& bus)
-	{
-		Byte b = FetchByte(bus);
-		Byte result = A - b;
-
-		C = A >= b;
-		Z = A == b;
-		N = (result & 0b10000000) > 0;
-	}
-
-	void CPX_IMM(BUS& bus)
-	{
-		Byte b = FetchByte(bus);
-		Byte result = X - b;
-
-		C = X >= b;
-		Z = X == b;
-		N = (result & 0b10000000) > 0;
-	}
-
-	void CPY_IMM(BUS& bus)
-	{
-		Byte b = FetchByte(bus);
-		Byte result = Y - b;
-
-		C = Y >= b;
-		Z = Y == b;
-		N = (result & 0b10000000) > 0;
-	}
-
-	void AND_IMM(BUS& bus)
-	{
-		Byte b = FetchByte(bus);
-		A &= b;
-
-		Z = A == 0;
-		N = (A & 0b10000000) > 0;
-	}
-
-	void AND_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte b = ReadByte(bus, addr);
-		A &= b;
-
-		Z = A == 0;
-		N = (A & 0b10000000) > 0;
-	}
-
-	void EOR_IMM(BUS& bus)
-	{
-		Byte b = FetchByte(bus);
-		A ^= b;
-
-		Z = A == 0;
-		N = (A & 0b10000000) > 0;
-	}
-
-	void EOR_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte b = ReadByte(bus, addr);
-		A ^= b;
-
-		Z = A == 0;
-		N = (A & 0b10000000) > 0;
-	}
-
-	void ORA_IMM(BUS& bus)
-	{
-		Byte b = FetchByte(bus);
-		A |= b;
-
-		Z = A == 0;
-		N = (A & 0b10000000) > 0;
-	}
-
-	void ORA_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte b = ReadByte(bus, addr);
-		A |= b;
-
-		Z = A == 0;
-		N = (A & 0b10000000) > 0;
-	}
-
-	void DEY_IMP(BUS& bus)
-	{
-		Y--;
-		numCycles++;
-
-		Z = Y == 0;
-		N = (Y & 0b10000000) > 0;
-	}
-
-	void DEX_IMP(BUS& bus)
-	{
-		X--;
-		numCycles++;
-
-		Z = X == 0;
-		N = (X & 0b10000000) > 0;
-	}
-
-	void INX_IMP(BUS& bus)
-	{
-		X++;
-		numCycles++;
-
-		Z = X == 0;
-		N = (X & 0b10000000) > 0;
-	}
-
-	void INY_IMP(BUS& bus)
-	{
-		Y++;
-		numCycles++;
-
-		Z = Y == 0;
-		N = (Y & 0b10000000) > 0;
-	}
-
-	void TXA_IMP(BUS& bus)
-	{
-		A = X;
-		numCycles++;
-
-		Z = A == 0;
-		N = (A & 0b10000000) > 0;
-	}
-
-	void TYA_IMP(BUS& bus)
-	{
-		A = Y;
-		numCycles++;
-
-		Z = A == 0;
-		N = (A & 0b10000000) > 0;
-	}
-
-	void TAX_IMP(BUS& bus)
-	{
-		X = A;
-		numCycles++;
-
-		Z = X == 0;
-		N = (X & 0b10000000) > 0;
-	}
-
-	void TAY_IMP(BUS& bus)
-	{
-		Y = A;
-		numCycles++;
-
-		Z = Y == 0;
-		N = (Y & 0b10000000) > 0;
-	}
-
-	void ROR_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte b = ReadByte(bus, addr);
-
-		Byte value = b >> 1;
-		numCycles++;
-
-		// Set bit 7 of value byte to value of the carry flag
-		value |= C << 7;
-		// Set carry bit to bit 0 of original byte
-		C = 0b00000001 & b;
-
-		SendByte(bus, addr, value);
-
-		Z = (value == 0);
-		N = (value & 0b10000000) > 0;
-	}
-
-	void ROL_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte b = ReadByte(bus, addr);
-
-		Byte value = b << 1;
-		numCycles++;
-
-		// Set bit 0 of value byte to value of the carry flag
-		value |= C;
-		// Set carry bit to bit 7 of original byte
-		C = 0b10000000 & b;
-
-		SendByte(bus, addr, value);
-
-		Z = (value == 0);
-		N = (value & 0b10000000) > 0;
-	}
-
-	void SEC_IMP(BUS& bus)
-	{
-		C = 1;
-		numCycles++;
-	}
-
-	void SED_IMP(BUS& bus)
-	{
-		D = 1;
-		numCycles++;
-	}
-
-	void SEI_IMP(BUS& bus)
-	{
-		I = 1;
-		numCycles++;
-	}
-
-	void CLC_IMP(BUS& bus)
-	{
-		C = 0;
-		numCycles++;
-	}
-
-	void CLD_IMP(BUS& bus)
-	{
-		D = 0;
-		numCycles++;
-	}
-
-	void CLI_IMP(BUS& bus)
-	{
-		I = 0;
-		numCycles++;
-	}
-
-	void CLV_IMP(BUS& bus)
-	{
-		V = 0;
-		numCycles++;
-	}
-
-	void LDA_IMM(BUS& bus)
-	{
-		Byte b = FetchByte(bus);
-		A = b;
-
-		Z = (A == 0);
-		N = (A & 0x0080);
-	}
-
-	void LDA_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		A = ReadByte(bus, addr);
-
-		Z = (A == 0);
-		N = (A & 0x0080);
-	}
-
-	void STA_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		SendByte(bus, addr, A);
-	}
-
-	void STX_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		SendByte(bus, addr, X);
-	}
-
-	void STY_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		SendByte(bus, addr, Y);
-	}
-
-	void JMP_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		PC = addr;
-	}
-
-	void INC_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte value = ReadByte(bus, addr);
-		value++;
-		SendByte(bus, addr, value);
-		numCycles++;
-
-		Z = (value == 0);
-		N = (value & 0b10000000) > 0;
-	}
-
-	void DEC_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte value = ReadByte(bus, addr);
-		value--;
-		SendByte(bus, addr, value);
-		numCycles++;
-
-		Z = (value == 0);
-		N = (value & 0b10000000) > 0;
-	}
-
-	void NOP_IMP(BUS& bus)
-	{
-		numCycles++;
-	}
-
-	void LDX_IMM(BUS& bus)
-	{
-		Byte b = FetchByte(bus);
-		X = b;
-		Z = (X == 0);
-		N = (X & 0x0080);
-	}
-
-	void LDY_IMM(BUS& bus)
-	{
-		Byte b = FetchByte(bus);
-		Y = b;
-		Z = (Y == 0);
-		N = (Y & 0x0080);
-	}
-
-	void LDX_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		X = ReadByte(bus, addr);
-		Z = (X == 0);
-		N = (X & 0x0080);
-	}
-
-	void LDY_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Y = ReadByte(bus, addr);
-		Z = (Y == 0);
-		N = (Y & 0x0080);
-	}
-	// TODO: Add decimal flag support for math instructions? (ADC, SBC, etc.)
-	void ADC_IMM(BUS& bus)
-	{
-		Byte value = FetchByte(bus);
-		Word sum = value + A + C;
-
-		V = ((A ^ sum) & (value ^ sum) & 0x0080);
-		C = sum & 0xFF00;
-		Z = ((sum & 0x00FF) == 0);
-		N = (sum & 0x0080);
-
-		A = sum & 0x00FF;
-	}
-
-	void ADC_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte value = ReadByte(bus, addr);
-		Word sum = value + A + C;
-
-		V = ((A ^ sum) & (value ^ sum) & 0x0080);
-		C = sum & 0xFF00;
-		Z = ((sum & 0x00FF) == 0);
-		N = (sum & 0x0080);
-
-		A = sum & 0x00FF;
-	}
-
-	void SBC_IMM(BUS& bus)
-	{
-		Word value = ((Word)FetchByte(bus)) ^ 0x00FF;
-		Word sum = value + A + C;
-
-		V = ((A ^ sum) & (value ^ sum) & 0x0080);
-		C = sum & 0xFF00;
-		Z = ((sum & 0x00FF) == 0);
-		N = (sum & 0x0080);
-
-		A = sum & 0x00FF;
-	}
-
-	void SBC_ABS(BUS& bus)
-	{
-		Word addr = FetchWord(bus);
-		Byte b = ReadByte(bus, addr);
-
-		Word value = (Word)b ^ 0x00FF;
-		Word sum = value + A + C;
-
-		V = ((A ^ sum) & (value ^ sum) & 0x0080);
-		C = sum & 0xFF00;
-		Z = ((sum & 0x00FF) == 0);
-		N = (sum & 0x0080);
-
-		A = sum & 0x00FF;
-	}
-
-	// Excecutes based on num clock cycles
-	void Execute(BUS& bus, uint cycles)
-	{
-		while (numCycles < cycles + 2)
-		{
-			// ALL CLOCK CYCLE COUNTS FOR ALL INSTRUCTIONS INCLUDE FETCHING THE INSTRUCTION ITSELF
-			Byte instruction = FetchByte(bus);
-
-			try
-			{
-				// Find and call relavent function from instructions map
-				void(CPU6502:: * func)(BUS&) = INSTRUCTIONS.at(instruction);
-				(this->*func)(bus);
-			}
-			catch (std::out_of_range)
-			{
-				// std::cout << "Instruction " << std::hex << std::setw(3) << instruction << " not recognized" << std::endl;
-			}
-		}
-	}
+    bool debug = false; // Determines whether debug text will be printed to the screen
+
+    Bus* bus;
+
+    uint numCycles = 0;
+
+    Word PC = 0xFFFC; // Program Counter
+    Byte SP = 0xFF; // Stack Pointer
+
+    // Registers
+    Byte A = 0; // Accumulator
+    Byte X = 0;
+    Byte Y = 0;
+
+    // Status Flags
+    bool N = false; // Negative
+    bool V = false; // Overflow
+    bool B = false; // Break
+    bool D = false; // Decimal
+    bool I = false; // Interrupt Disable
+    bool Z = false; // Zero
+    bool C = false; // Carry
+
+    explicit CPU6502(Bus* bus)
+    {
+        this->bus = bus;
+    }
+
+    void Clock(const uint c = 1)
+    {
+        if (useClockTime) std::this_thread::sleep_for(std::chrono::nanoseconds(static_cast<int>(clockTime * 1000000.0f * c)));
+        numCycles += c;
+    }
+
+    void Reset()
+    {
+        // ADD CLOCK TIMINGS FOR RESET
+
+        // Set PC to position to read start vector
+        PC = 0xFFFC;
+        // Reset stack pointer to top of stack
+        SP = 0xFF;
+
+        C = N = V = Z = D = I = false;
+        A = X = Y = 0;
+
+        // Read start vector
+        PC = FetchWord();
+    }
+
+    // Converts stack pointer to absolute address
+    Word SPToAddress() const
+    {
+        return 0x100 + SP;
+    }
+
+    // Fetches next byte at the PC and increments the PC
+    Byte FetchByte()
+    {
+        return ReadByte(PC++);
+    }
+
+    // Fetches next word at the PC in little endian
+    Word FetchWord()
+    {
+        Word w = FetchByte();
+        w |= FetchByte() << 8;
+        return w;
+    }
+
+    // Gets byte at address
+    Byte ReadByte(const Word addr)
+    {
+        Clock(1);
+        const Byte b = bus->ReadByte(addr);
+        if (debug) std::cout << std::hex << std::setw(4) << addr << " READ " << std::setw(2) << +b << std::endl;
+        return b;
+    }
+
+    // Gets word in little endian at address
+    Word ReadWord(const Word addr)
+    {
+        return ReadByte(addr) + (static_cast<Word>(ReadByte(addr + 1)) << 8);
+    }
+
+    // Writes byte to address
+    void WriteByte(const Word addr, const Byte b)
+    {
+        bus->WriteByte(addr, b);
+        Clock(1);
+        if (debug) std::cout << std::hex << std::setw(4) << addr << " WRITE " << std::setw(2) << +b << std::endl;
+    }
+
+    // Writes word in little endian to address
+    void WriteWord(const Word addr, const Word w)
+    {
+        WriteByte(addr, w & 0b00001111);
+        WriteByte(addr + 1, w >> 8);
+    }
+
+    void IRQ()
+    {
+        if (I == false) {
+            WriteWord(SPToAddress() - 1, PC + 1);
+            SP -= 2;
+
+            B = false;
+            I = true;
+            PHP();
+
+            // Read IRQ interrupt vector
+            PC = ReadWord(0xFFFE);
+            Clock(1);
+        }
+    }
+
+    void NMI()
+    {
+        WriteWord(SPToAddress() - 1, PC + 1);
+        SP -= 2;
+
+        B = false;
+        I = true;
+        PHP();
+
+        // Read NMI interrupt vector
+        PC = ReadWord(0xFFFA);
+        Clock(1);
+    }
+
+    // Executes the number of cycles provided
+    void Execute(const uint cycles)
+    {
+        const int startCycles = numCycles;
+        int deltaCycles = 0;
+        while (deltaCycles < cycles && running)
+        {
+            // clock counts for all instructions include fetching the instruction itself
+            // CHANGE TO MAP
+            switch (FetchByte())
+            {
+                // No addressing mode function call = implied
+                // "ReadByte(Absolute())" means the instruction uses the byte at the supplied address (e.g. ADC, LDA)
+                // "Absolute()" means the instruction uses the address itself (e.g. STA, JMP)
+                // A boolean value in the instruction arguments represents the Accumulator addressing mode
+                case 0xEA:
+                    NOP();
+                    break;
+
+                case 0x2C:
+                    BIT(ReadByte(Absolute()));
+                    break;
+                case 0x24:
+                    BIT(ReadByte(ZeroPage()));
+                    break;
+
+                case 0xA9:
+                    LDA(Immediate());
+                    break;
+                case 0xAD:
+                    LDA(ReadByte(Absolute()));
+                    break;
+                case 0xA5:
+                    LDA(ReadByte(ZeroPage()));
+                    break;
+                case 0xB5:
+                    LDA(ReadByte(ZeroPageX()));
+                    break;
+                case 0xBD:
+                    LDA(ReadByte(AbsoluteX()));
+                    break;
+                case 0xB9:
+                    LDA(ReadByte(AbsoluteY()));
+                    break;
+                case 0xA1:
+                    LDA(ReadByte(IndirectX()));
+                    break;
+                case 0xB1:
+                    LDA(ReadByte(IndirectY()));
+                    break;
+
+                case 0xA2:
+                    LDX(Immediate());
+                    break;
+                case 0xAE:
+                    LDX(ReadByte(Absolute()));
+                    break;
+                case 0xA6:
+                    LDX(ReadByte(ZeroPage()));
+                    break;
+                case 0xB6:
+                    LDX(ReadByte(ZeroPageY()));
+                    break;
+                case 0xBE:
+                    LDX(ReadByte(AbsoluteY()));
+                    break;
+
+                case 0xA0:
+                    LDY(Immediate());
+                    break;
+                case 0xAC:
+                    LDY(ReadByte(Absolute()));
+                    break;
+                case 0xA4:
+                    LDY(ReadByte(ZeroPage()));
+                    break;
+                case 0xB4:
+                    LDY(ReadByte(ZeroPageX()));
+                    break;
+                case 0xBC:
+                    LDY(ReadByte(AbsoluteX()));
+                    break;
+
+                case 0x8D:
+                    STA(Absolute());
+                    break;
+                case 0x85:
+                    STA(ZeroPage());
+                    break;
+                case 0x95:
+                    STA(ZeroPageX());
+                    break;
+                case 0x9D:
+                    STA(AbsoluteX());
+                    break;
+                case 0x99:
+                    STA(AbsoluteY());
+                    break;
+                case 0x81:
+                    STA(IndirectX());
+                    break;
+                case 0x91:
+                    STA(IndirectY());
+                    break;
+
+                case 0x8E:
+                    STX(Absolute());
+                    break;
+                case 0x86:
+                    STX(ZeroPage());
+                    break;
+                case 0x96:
+                    STX(ZeroPageY());
+                    break;
+
+                case 0x8C:
+                    STY(Absolute());
+                    break;
+                case 0x84:
+                    STY(ZeroPage());
+                    break;
+                case 0x94:
+                    STY(ZeroPageX());
+                    break;
+
+                case 0xAA:
+                    TAX();
+                    break;
+
+                case 0xA8:
+                    TAY();
+                    break;
+
+                case 0xBA:
+                    TSX();
+                    break;
+
+                case 0x8A:
+                    TXA();
+                    break;
+
+                case 0x9A:
+                    TXS();
+                    break;
+
+                case 0x98:
+                    TYA();
+                    break;
+
+                case 0x48:
+                    PHA();
+                    break;
+
+                case 0x68:
+                    PLA();
+                    break;
+
+                case 0x08:
+                    PHP();
+                    break;
+
+                case 0x28:
+                    PLP();
+                    break;
+
+                case 0xEE:
+                    INC(Absolute());
+                    break;
+                case 0xE6:
+                    INC(ZeroPage());
+                    break;
+                case 0xF6:
+                    INC(ZeroPageX());
+                    break;
+                case 0xFE:
+                    INC(AbsoluteX());
+                    break;
+
+                case 0xE8:
+                    INX();
+                    break;
+
+                case 0xC8:
+                    INY();
+                    break;
+
+                case 0xCE:
+                    DEC(Absolute());
+                    break;
+                case 0xC6:
+                    DEC(ZeroPage());
+                    break;
+                case 0xD6:
+                    DEC(ZeroPageX());
+                    break;
+                case 0xDE:
+                    DEC(AbsoluteX());
+                    break;
+
+                case 0xCA:
+                    DEX();
+                    break;
+
+                case 0x88:
+                    DEY();
+                    break;
+
+                case 0x29:
+                    AND(Immediate());
+                    break;
+                case 0x2D:
+                    AND(ReadByte(Absolute()));
+                    break;
+                case 0x25:
+                    AND(ReadByte(ZeroPage()));
+                    break;
+                case 0x35:
+                    AND(ReadByte(ZeroPageX()));
+                    break;
+                case 0x3D:
+                    AND(ReadByte(AbsoluteX()));
+                    break;
+                case 0x39:
+                    AND(ReadByte(AbsoluteY()));
+                    break;
+                case 0x21:
+                    AND(ReadByte(IndirectX()));
+                    break;
+                case 0x31:
+                    AND(ReadByte(IndirectY()));
+                    break;
+
+                case 0x09:
+                    ORA(Immediate());
+                    break;
+                case 0x0D:
+                    ORA(ReadByte(Absolute()));
+                    break;
+                case 0x05:
+                    ORA(ReadByte(ZeroPage()));
+                    break;
+                case 0x15:
+                    ORA(ReadByte(ZeroPageX()));
+                    break;
+                case 0x1D:
+                    ORA(ReadByte(AbsoluteX()));
+                    break;
+                case 0x19:
+                    ORA(ReadByte(AbsoluteY()));
+                    break;
+                case 0x01:
+                    ORA(ReadByte(IndirectX()));
+                    break;
+                case 0x11:
+                    ORA(ReadByte(IndirectY()));
+                    break;
+
+                case 0x49:
+                    EOR(Immediate());
+                    break;
+                case 0x4D:
+                    EOR(ReadByte(Absolute()));
+                    break;
+                case 0x45:
+                    EOR(ReadByte(ZeroPage()));
+                    break;
+                case 0x55:
+                    EOR(ReadByte(ZeroPageX()));
+                    break;
+                case 0x5D:
+                    EOR(ReadByte(AbsoluteX()));
+                    break;
+                case 0x59:
+                    EOR(ReadByte(AbsoluteY()));
+                    break;
+                case 0x41:
+                    EOR(ReadByte(IndirectX()));
+                    break;
+                case 0x51:
+                    EOR(ReadByte(IndirectY()));
+                    break;
+
+                case 0xC9:
+                    CMP(Immediate());
+                    break;
+                case 0xCD:
+                    CMP(ReadByte(Absolute()));
+                    break;
+                case 0xC5:
+                    CMP(ReadByte(ZeroPage()));
+                    break;
+                case 0xD5:
+                    CMP(ReadByte(ZeroPageX()));
+                    break;
+                case 0xDD:
+                    CMP(ReadByte(AbsoluteX()));
+                    break;
+                case 0xD9:
+                    CMP(ReadByte(AbsoluteY()));
+                    break;
+                case 0xC1:
+                    CMP(ReadByte(IndirectX()));
+                    break;
+                case 0xD1:
+                    CMP(ReadByte(IndirectY()));
+                    break;
+
+                case 0xE0:
+                    CPX(Immediate());
+                    break;
+                case 0xEC:
+                    CPX(ReadByte(Absolute()));
+                    break;
+                case 0xE4:
+                    CPX(ReadByte(ZeroPage()));
+                    break;
+
+                case 0xC0:
+                    CPY(Immediate());
+                    break;
+                case 0xCC:
+                    CPY(ReadByte(Absolute()));
+                    break;
+                case 0xC4:
+                    CPY(ReadByte(ZeroPage()));
+                    break;
+
+                case 0x0A:
+                    ASL(0x00, true);
+                    break;
+                case 0x0E:
+                    ASL(Absolute(), false);
+                    break;
+                case 0x06:
+                    ASL(ZeroPage(), false);
+                    break;
+                case 0x16:
+                    ASL(ZeroPageX(), false);
+                    break;
+                case 0x1E:
+                    ASL(AbsoluteX(), false);
+                    break;
+
+                case 0x4A:
+                    LSR(0x00, true);
+                    break;
+                case 0x4E:
+                    LSR(Absolute(), false);
+                    break;
+                case 0x46:
+                    LSR(ZeroPage(), false);
+                    break;
+                case 0x56:
+                    LSR(ZeroPageX(), false);
+                    break;
+                case 0x5E:
+                    LSR(AbsoluteX(), false);
+                    break;
+
+                case 0x2A:
+                    ROL(0x00, true);
+                    break;
+                case 0x2E:
+                    ROL(Absolute(), false);
+                    break;
+                case 0x26:
+                    ROL(ZeroPage(), false);
+                    break;
+                case 0x36:
+                    ROL(ZeroPageX(), false);
+                    break;
+                case 0x3E:
+                    ROL(AbsoluteX(), false);
+                    break;
+
+                case 0x6A:
+                    ROR(0x00, true);
+                    break;
+                case 0x6E:
+                    ROR(Absolute(), false);
+                    break;
+                case 0x66:
+                    ROR(ZeroPage(), false);
+                    break;
+                case 0x76:
+                    ROR(ZeroPageX(), false);
+                    break;
+                case 0x7E:
+                    ROR(AbsoluteX(), false);
+                    break;
+
+                case 0x4C:
+                    JMP(Absolute());
+                    break;
+                case 0x6C:
+                    JMP(Indirect());
+                    break;
+
+                case 0x20:
+                    JSR(Absolute());
+                    break;
+
+                case 0x60:
+                    RTS();
+                    break;
+
+                case 0xF0:
+                    BEQ(Relative());
+                    break;
+
+                case 0xD0:
+                    BNE(Relative());
+                    break;
+
+                case 0xB0:
+                    BCS(Relative());
+                    break;
+
+                case 0x90:
+                    BCC(Relative());
+                    break;
+
+                case 0x10:
+                    BPL(Relative());
+                    break;
+
+                case 0x30:
+                    BMI(Relative());
+                    break;
+
+                case 0x50:
+                    BVC(Relative());
+                    break;
+
+                case 0x07:
+                    BVS(Relative());
+                    break;
+
+                case 0x00:
+                    BRK();
+                    break;
+
+                case 0x40:
+                    RTI();
+                    break;
+
+                case 0x18:
+                    CLC();
+                    break;
+
+                case 0x38:
+                    SEC();
+                    break;
+
+                case 0xD8:
+                    CLD();
+                    break;
+
+                case 0xF8:
+                    SED();
+                    break;
+
+                case 0x58:
+                    CLI();
+                    break;
+
+                case 0x78:
+                    SEI();
+                    break;
+
+                case 0xB8:
+                    CLV();
+                    break;
+
+                case 0x69:
+                    ADC(Immediate());
+                    break;
+                case 0x6D:
+                    ADC(ReadByte(Absolute()));
+                    break;
+                case 0x65:
+                    ADC(ReadByte(ZeroPage()));
+                    break;
+                case 0x75:
+                    ADC(ReadByte(ZeroPageX()));
+                    break;
+                case 0x7D:
+                    ADC(ReadByte(AbsoluteX()));
+                    break;
+                case 0x79:
+                    ADC(ReadByte(AbsoluteY()));
+                    break;
+                case 0x61:
+                    ADC(ReadByte(IndirectX()));
+                    break;
+                case 0x71:
+                    ADC(ReadByte(IndirectY()));
+                    break;
+
+                case 0xE9:
+                    SBC(Immediate());
+                    break;
+                case 0xED:
+                    SBC(ReadByte(Absolute()));
+                    break;
+                case 0xE5:
+                    SBC(ReadByte(ZeroPage()));
+                    break;
+                case 0xF5:
+                    SBC(ReadByte(ZeroPageX()));
+                    break;
+                case 0xFD:
+                    SBC(ReadByte(AbsoluteX()));
+                    break;
+                case 0xF9:
+                    SBC(ReadByte(AbsoluteY()));
+                    break;
+                case 0xE1:
+                    SBC(ReadByte(IndirectX()));
+                    break;
+                case 0xF1:
+                    SBC(ReadByte(IndirectY()));
+                    break;
+
+                default:
+                    std::cout << "Instruction not recognized" << std::endl;
+            }
+            // std::cout << std::hex << std::setw(2) << +bus->ram.data[0x0001] << +bus->ram.data[0x0000] << std::endl;
+            deltaCycles = numCycles - startCycles;
+        }
+    }
+
+    // Addressing mode helpers (Implied and Accumulator are one byte instructions so no function required)
+    Byte Immediate()
+    {
+        return FetchByte();
+    }
+
+    Word Absolute()
+    {
+        return FetchWord();
+    }
+
+    Word AbsoluteX()
+    {
+        const Word addr = FetchWord();
+
+        if ((addr & 0x00FF) + X > 0x00FF)
+        {
+            Clock(1);
+        }
+
+        return addr + X;
+    }
+
+    Word AbsoluteY()
+    {
+        const Word addr = FetchWord();
+
+        if ((addr & 0x00FF) + Y > 0x00FF)
+        {
+            Clock(1);
+        }
+
+        return addr + Y;
+    }
+
+    Word ZeroPage()
+    {
+        return 0x00FF & FetchByte();
+    }
+
+    Word ZeroPageX()
+    {
+        Clock(1);
+        return 0x00FF & FetchByte() + X;
+    }
+
+    Word ZeroPageY()
+    {
+        Clock(1);
+        return 0x00FF & FetchByte() + Y;
+    }
+
+    Word Indirect()
+    {
+        return ReadWord(FetchWord());
+    }
+
+    Word IndirectX()
+    {
+        return ReadWord(ZeroPageX());
+    }
+
+    Word IndirectY()
+    {
+        const Word addr = ReadWord(ZeroPage());
+        if ((addr & 0x00FF) + Y > 0x00FF)
+        {
+            Clock(1);
+        }
+        return addr + Y;
+    }
+
+    Word Relative()
+    {
+        Word rel = ZeroPage();
+
+        // if is negative
+        if (rel & 0x80)
+        {
+            rel |= 0xFF00;
+        }
+
+        return rel + PC;
+    }
+
+    // Make set flags function for auto setting flags based on value?
+    // TODO: Make helper functions for instructions (push to stack, have IRQ and Reset vectors stored somewhere)
+    // INSTRUCTIONS
+    void NOP()
+    {
+        Clock(1);
+    }
+
+    void BIT(const Byte b)
+    {
+        N = b & 0x80;
+        V = b & 0x40;
+        Z = A & b == 0;
+    }
+
+    // Transfers
+    void LDA(const Byte b)
+    {
+        A = b;
+
+        Z = A == 0;
+        N = A & 0x80;
+    }
+
+    void LDX(const Byte b)
+    {
+        X = b;
+
+        Z = X == 0;
+        N = X & 0x80;
+    }
+
+    void LDY(const Byte b)
+    {
+        Y = b;
+
+        Z = Y == 0;
+        N = Y & 0x80;
+    }
+
+    void STA(const Word addr)
+    {
+        WriteByte(addr, A);
+    }
+
+    void STX(const Word addr)
+    {
+        WriteByte(addr, X);
+    }
+
+    void STY(const Word addr)
+    {
+        WriteByte(addr, Y);
+    }
+
+    void TAX()
+    {
+        X = A;
+        Z = X == 0;
+        N = X & 0x80;
+        Clock(1);
+    }
+
+    void TAY()
+    {
+        Y = A;
+        Z = Y == 0;
+        N = Y & 0x80;
+        Clock(1);
+    }
+
+    void TSX()
+    {
+        X = SP;
+        Z = X == 0;
+        N = X & 0x80;
+        Clock(1);
+    }
+
+    void TXA()
+    {
+        A = X;
+        Z = A == 0;
+        N = A & 0x80;
+        Clock(1);
+    }
+
+    void TXS()
+    {
+        SP = X;
+        Clock(1);
+    }
+
+    void TYA()
+    {
+        A = Y;
+        Z = A == 0;
+        N = A & 0x80;
+        Clock(1);
+    }
+
+    // Stack
+    void PHA()
+    {
+        WriteByte(SPToAddress(), A);
+        SP--;
+        Clock(1);
+    }
+
+    void PLA()
+    {
+        SP++;
+        A = ReadByte(SPToAddress());
+        Clock(2);
+        Z = A == 0;
+        N = A & 0x80;
+    }
+
+    void PHP()
+    {
+        B = true;
+        WriteByte(SPToAddress(), N << 7 + V << 6 + 1 << 5 + B << 4 + D << 3 + I << 2 + Z << 1 + C << 0);
+        SP--;
+        Clock(1);
+        B = false;
+    }
+
+    void PLP()
+    {
+        SP++;
+        const Byte status = ReadByte(SPToAddress());
+        C = status & 0b00000001;
+        Z = status & 0b00000010;
+        I = status & 0b00000100;
+        D = status & 0b00001000;
+        B = status & 0b00010000;
+        V = status & 0b01000000;
+        N = status & 0b10000000;
+        Clock(2);
+    }
+
+    // Increments
+    void INC(const Word addr)
+    {
+        const Byte b = ReadByte(addr);
+        WriteByte(addr, b + 1);
+        Clock(1);
+
+        Z = (b + 1 & 0xFF) == 0;
+        N = b + 1 & 0xFF & 0x80;
+    }
+
+    void INX()
+    {
+        X++;
+        Clock(1);
+
+        Z = X == 0;
+        N = X & 0x80;
+    }
+
+    void INY()
+    {
+        Y++;
+        Clock(1);
+
+        Z = Y == 0;
+        N = Y & 0x80;
+    }
+
+    // Decrements
+    void DEC(const Word addr)
+    {
+        const Byte b = ReadByte(addr);
+        WriteByte(addr, b - 1);
+        Clock(1);
+
+        Z = (b - 1 & 0xFF) == 0;
+        N = b - 1 & 0xFF & 0x80;
+    }
+
+    void DEX()
+    {
+        X--;
+        Clock(1);
+
+        Z = X == 0;
+        N = X & 0x80;
+    }
+
+    void DEY()
+    {
+        Y--;
+        Clock(1);
+
+        Z = Y == 0;
+        N = Y & 0x80;
+    }
+
+    // Logic
+    void AND(const Byte b)
+    {
+        A &= b;
+
+        Z = A == 0;
+        N = A & 0x80;
+    }
+
+    void ORA(const Byte b)
+    {
+        A |= b;
+
+        Z = A == 0;
+        N = A & 0x80;
+    }
+
+    void EOR(const Byte b)
+    {
+        A ^= b;
+
+        Z = A == 0;
+        Z = A & 0x80;
+    }
+
+    // Comparisons
+    void CMP(const Byte b)
+    {
+        const Byte diff = static_cast<Word>(A) - static_cast<Word>(b) & 0xFF;
+
+        N = diff & 0x80;
+        C = A >= b;
+        Z = A == b;
+    }
+
+    void CPX(const Byte b)
+    {
+        const Byte diff = static_cast<Word>(X) - static_cast<Word>(b) & 0xFF;
+
+        N = diff & 0x80;
+        C = X >= b;
+        Z = X == b;
+    }
+
+    void CPY(const Byte b)
+    {
+        const Byte diff = static_cast<Word>(Y) - static_cast<Word>(b) & 0xFF;
+
+        N = diff & 0x80;
+        C = Y >= b;
+        Z = Y == b;
+    }
+
+    // Shifts
+    void ASL(const Word addr, const bool acc)
+    {
+        if (acc)
+        {
+            C = A & 0x80;
+
+            A <<= 1;
+
+            Z = A == 0;
+            N = A & 0x80;
+        }
+        else
+        {
+            Byte b = ReadByte(addr);
+
+            C = b & 0x80;
+            b <<= 1;
+
+            Z = b == 0;
+            N = b & 0x80;
+
+            WriteByte(addr, b);
+        }
+
+        Clock(1);
+    }
+
+    void LSR(const Word addr, const bool acc)
+    {
+        if (acc)
+        {
+            C = A & 0x01;
+            A >>= 1;
+
+            Z = A == 0;
+            N = A & 0x80;
+        }
+        else
+        {
+            Byte b = ReadByte(addr);
+
+            C = b & 0x01;
+            b >>= 1;
+
+            Z = b == 0;
+            N = b & 0x80;
+
+            WriteByte(addr, b);
+        }
+
+        Clock(1);
+    }
+
+    // Rotations
+    void ROL(const Word addr, const bool acc)
+    {
+        if (acc)
+        {
+            Byte temp = A;
+            temp <<= 1;
+            temp &= 0b11111110;
+            temp += C;
+            C = A >> 7;
+
+            A = temp;
+
+            Z = A == 0;
+            N = A & 0x80;
+            Clock(1);
+        }
+        else
+        {
+            const Byte b = ReadByte(addr);
+            Byte temp = b;
+            temp <<= 1;
+            temp &= 0b11111110;
+            temp += C;
+
+            C = b >> 7;
+
+            WriteByte(addr, temp);
+            Z = temp == 0;
+            N = temp & 0x80;
+            Clock(1);
+        }
+    }
+
+    void ROR(const Word addr, const bool acc)
+    {
+        if (acc)
+        {
+            Byte temp = A;
+            temp >>= 1;
+            temp &= 0b01111111;
+            temp += C << 7;
+            C = A & 1;
+
+            A = temp;
+
+            Z = A == 0;
+            N = A & 0x80;
+            Clock(1);
+        }
+        else
+        {
+            const Byte b = ReadByte(addr);
+            Byte temp = b;
+            temp >>= 1;
+            temp &= 0b01111111;
+            temp += C << 7;
+
+            C = b & 1;
+
+            WriteByte(addr, temp);
+            Z = temp == 0;
+            N = temp & 0x80;
+            Clock(1);
+        }
+    }
+
+    // Jumps/Subroutines
+    void JMP(const Word addr)
+    {
+        PC = addr;
+    }
+
+    void JSR(const Word addr)
+    {
+        PC--;
+
+        WriteWord(SPToAddress() - 1, PC);
+        SP -= 2;
+
+        PC = addr;
+        Clock(1);
+    }
+
+    void RTS()
+    {
+        SP++;
+        PC = ReadByte(SPToAddress());
+        SP++;
+        PC |= ReadByte(SPToAddress()) << 8;
+        PC++;
+        Clock(3);
+    }
+
+    // Branches
+    void BEQ(const Word addr)
+    {
+        if (Z == 1)
+        {
+            Clock(1);
+
+            if ((addr & 0xFF00) != (PC & 0xFF00))
+            {
+                Clock(1);
+            }
+
+            PC = addr;
+        }
+    }
+
+    void BNE(const Word addr)
+    {
+        if (Z == 0)
+        {
+            Clock(1);
+
+            if ((addr & 0xFF00) != (PC & 0xFF00))
+            {
+                Clock(1);
+            }
+
+            PC = addr;
+        }
+    }
+
+    void BCS(const Word addr)
+    {
+        if (C == 1)
+        {
+            Clock(1);
+
+            if ((addr & 0xFF00) != (PC & 0xFF00))
+            {
+                Clock(1);
+            }
+
+            PC = addr;
+        }
+    }
+
+    void BCC(const Word addr)
+    {
+        if (C == 0)
+        {
+            Clock(1);
+
+            if ((addr & 0xFF00) != (PC & 0xFF00))
+            {
+                Clock(1);
+            }
+
+            PC = addr;
+        }
+    }
+
+    void BPL(const Word addr)
+    {
+        if (N == 0)
+        {
+            Clock(1);
+
+            if ((addr & 0xFF00) != (PC & 0xFF00))
+            {
+                Clock(1);
+            }
+
+            PC = addr;
+        }
+    }
+
+    void BMI(const Word addr)
+    {
+        if (N == 1)
+        {
+            Clock(1);
+
+            if ((addr & 0xFF00) != (PC & 0xFF00))
+            {
+                Clock(1);
+            }
+
+            PC = addr;
+        }
+    }
+
+    void BVC(const Word addr)
+    {
+        if (V == 0)
+        {
+            Clock(1);
+
+            if ((addr & 0xFF00) != (PC & 0xFF00))
+            {
+                Clock(1);
+            }
+
+            PC = addr;
+        }
+    }
+
+    void BVS(const Word addr)
+    {
+        if (V == 1)
+        {
+            Clock(1);
+
+            if ((addr & 0xFF00) != (PC & 0xFF00))
+            {
+                Clock(1);
+            }
+
+            PC = addr;
+        }
+    }
+
+    // Interrupts
+    void BRK()
+    {
+        WriteWord(SPToAddress() - 1, PC + 1);
+        SP -= 2;
+
+        PHP();
+        B = true;
+
+        // Read IRQ interrupt vector
+        PC = ReadWord(0xFFFE);
+    }
+
+    void RTI()
+    {
+        SP++;
+        const Byte status = ReadByte(SPToAddress());
+        C = status & 0b00000001;
+        Z = status & 0b00000010;
+        I = status & 0b00000100;
+        D = status & 0b00001000;
+        V = status & 0b01000000;
+        N = status & 0b10000000;
+
+        SP++;
+        PC = ReadByte(SPToAddress());
+        SP++;
+        PC |= ReadByte(SPToAddress()) << 8;
+
+        Clock(2);
+    }
+
+    // Flags
+    void CLC()
+    {
+        C = false;
+        Clock(1);
+    }
+
+    void SEC()
+    {
+        C = true;
+        Clock(1);
+    }
+
+    void CLD()
+    {
+        D = false;
+        Clock(1);
+    }
+
+    void SED()
+    {
+        D = true;
+        Clock(1);
+    }
+
+    void CLI()
+    {
+        I = false;
+        Clock(1);
+    }
+
+    void SEI()
+    {
+        I = true;
+        Clock(1);
+    }
+
+    void CLV()
+    {
+        V = false;
+        Clock(1);
+    }
+
+    // TODO: Add decimal flag support for math instructions
+    // Arithmetic
+    void ADC(const Byte b)
+    {
+        const Word sum = b + A + C;
+
+        V = (A ^ sum) & (b ^ sum) & 0x0080;
+        C = sum & 0xFF00;
+        Z = (sum & 0x00FF) == 0;
+        N = sum & 0x0080;
+
+        A = sum & 0x00FF;
+    }
+
+    void SBC(const Byte b)
+    {
+        ADC(b ^ 0x00FF);
+    }
 };
 
-int main()
+struct Screen
 {
-	CPU6502 pc{};
-	BUS bus;
+    int x = 0;
+    int y = 0;
 
-	bus.ram.Initialize();
-	bus.rom.Initialize();
+    void Draw(const Byte color)
+    {
+        SDL_SetRenderDrawColor(renderer, (color >> 4 & 0b11) / 3.0f * 255, (color >> 2 & 0b11) / 3.0f * 255, (color & 0b11) / 3.0f * 255, 255);
+        SDL_RenderDrawPoint(renderer, x, y);
 
-	// Set reset vector
-	//bus.rom.data[0x7FFC] = 0x00;
-	//bus.rom.data[0x7FFD] = 0x80;
+        x++;
+        if (x >= width)
+        {
+            y++;
+            x = 0;
+            if (y >= height)
+            {
+                y = 0;
+                SDL_RenderPresent(renderer);
+            }
+        }
+    }
+};
 
-	// Load a program
-	std::vector<Byte> prg;
+struct GPU
+{
+    Bus* bus;
 
-	std::ifstream f;
-	f.open("program.bin", std::ios::binary | std::ios::in);
+    Screen* screen;
+    Byte x = 0;
+    Byte y = 0;
 
-	f >> std::noskipws;
-	if (f.fail())
-	{
-		// err
-	}
+    explicit GPU(Bus* bus, Screen* screen)
+    {
+        this->bus = bus;
+        this->screen = screen;
+    }
 
-	while (!f.eof())
-	{
-		Byte b;
+    void Run()
+    {
+        SDL_Init(SDL_INIT_EVERYTHING);
+        SDL_CreateWindowAndRenderer(width*12, height*12, 0, &window, &renderer);
+        SDL_RenderSetScale(renderer, 12, 12);
 
-		f >> b;
+        while (running)
+        {
+            while(SDL_PollEvent(&e))
+            {
+                if (e.type == SDL_QUIT)
+                {
+                    running = false;
+                }
+            }
 
-		if (f.fail())
-		{
-			// err
-			break;
-		}
+            // first 3 bits are 011 to address the vram through the bus correctly, next 6 bits of addr are y val, last 7 are x val
+            // color is stored in a byte: 2 bits for each color -> 64 colors
+            screen->Draw(bus->ReadByte((0b011 << 13) + (y << 7) + x));
 
-		prg.push_back(b);
-	}
+            x++;
+            if (x >= width)
+            {
+                y++;
+                x = 0;
+                if (y >= height)
+                {
+                    y = 0;
 
-	f.close();
+                    SDL_Delay(frameDelay);
+                }
+            }
+        }
+    }
+};
 
-	// Format console
-	std::cout << std::internal << std::setfill('0') << std::uppercase;
 
-	// Write program to ROM
-	for (uint i = 0; i <= prg.size(); i++)
-	{
-		bus.rom.data[i] = prg[i];
-	}
+int main(int argc, char** argv)
+{
+    // Format console
+    std::cout << std::internal << std::setfill('0') << std::uppercase;
 
-	pc.Reset(bus);
-	pc.Execute(bus, 100);
-	std::cout << std::hex << std::setw(4) << "Accumulator: " <<  +pc.A << std::endl;
-	std::cout << std::nouppercase;
-	std::cout << std::dec << "Clock cycles taken: " << pc.numCycles << std::endl;
+    Bus bus;
+    CPU6502 cpu(&bus);
+    cpu.debug = false;
+    Screen screen;
+    GPU gpu(&bus, &screen);
 
-	return 0;
+    // store rom and ram as files instead and read and write from them?
+    bus.ram.Initialize();
+    bus.rom.Initialize();
+    bus.vram.Initialize();
+
+    // Load a program
+    std::vector<Byte> prg;
+    std::ifstream f;
+    f.open("../program.bin", std::ios::binary | std::ios::in);
+
+    f >> std::noskipws;
+    if (f.fail())
+    {
+        // err
+    }
+
+    while (!f.eof())
+    {
+        Byte b;
+
+        f >> b;
+
+        if (f.fail())
+        {
+            // err
+            break;
+        }
+
+        prg.push_back(b);
+    }
+    f.close();
+
+    bus.rom.Load(prg);
+    //std::fill(std::begin(bus.vram.data), std::end(bus.vram.data), 0xFF);
+
+    cpu.Reset();
+    std::thread cpuThread(cpu.Execute, &cpu, 1000000000000);
+    std::thread gpuThread(gpu.Run, &gpu);
+
+    cpuThread.join();
+    gpuThread.join();
+
+    std::cout << std::endl << "Accumulator: " << std::hex << std::setw(2) << +cpu.A << std::endl;
+    std::cout << "X: " << std::hex << std::setw(2) << +cpu.X << std::endl;
+    std::cout << "Y: " << std::hex << std::setw(2) << +cpu.Y << std::endl;
+
+    std::cout << std::endl << "N V D I Z C" << std::endl;
+    std::cout << std::setw(1) << +cpu.N << " " << +cpu.V << " " << +cpu.D << " " << +cpu.I << " " << +cpu.Z << " " << +cpu.C << std::endl;
+    return 0;
 }
